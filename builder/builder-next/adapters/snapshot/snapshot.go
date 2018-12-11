@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/daemon/graphdriver"
@@ -16,6 +15,7 @@ import (
 	"github.com/moby/buildkit/snapshot"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 var keyParent = []byte("parent")
@@ -426,10 +426,11 @@ func (s *snapshotter) Close() error {
 }
 
 type mountable struct {
-	mu      sync.Mutex
-	mounts  []mount.Mount
-	acquire func() ([]mount.Mount, error)
-	release func() error
+	mu       sync.Mutex
+	mounts   []mount.Mount
+	acquire  func() ([]mount.Mount, error)
+	release  func() error
+	refCount int
 }
 
 func (m *mountable) Mount() ([]mount.Mount, error) {
@@ -437,6 +438,7 @@ func (m *mountable) Mount() ([]mount.Mount, error) {
 	defer m.mu.Unlock()
 
 	if m.mounts != nil {
+		m.refCount++
 		return m.mounts, nil
 	}
 
@@ -445,6 +447,7 @@ func (m *mountable) Mount() ([]mount.Mount, error) {
 		return nil, err
 	}
 	m.mounts = mounts
+	m.refCount = 1
 
 	return m.mounts, nil
 }
@@ -452,6 +455,13 @@ func (m *mountable) Mount() ([]mount.Mount, error) {
 func (m *mountable) Release() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if m.refCount > 1 {
+		m.refCount--
+		return nil
+	}
+
+	m.refCount = 0
 	if m.release == nil {
 		return nil
 	}

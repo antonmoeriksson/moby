@@ -15,19 +15,21 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 )
 
 const networkName = "bridge"
 
-func newExecutor(root string, net libnetwork.NetworkController) (executor.Executor, error) {
+func newExecutor(root, cgroupParent string, net libnetwork.NetworkController) (executor.Executor, error) {
 	networkProviders := map[pb.NetMode]network.Provider{
 		pb.NetMode_UNSET: &bridgeProvider{NetworkController: net},
 		pb.NetMode_HOST:  network.NewHostProvider(),
 		pb.NetMode_NONE:  network.NewNoneProvider(),
 	}
 	return runcexecutor.New(runcexecutor.Opt{
-		Root:              filepath.Join(root, "executor"),
-		CommandCandidates: []string{"docker-runc", "runc"},
+		Root:                filepath.Join(root, "executor"),
+		CommandCandidates:   []string{"runc"},
+		DefaultCgroupParent: cgroupParent,
 	}, networkProviders)
 }
 
@@ -62,13 +64,13 @@ func (iface *lnInterface) init(c libnetwork.NetworkController, n libnetwork.Netw
 	defer close(iface.ready)
 	id := identity.NewID()
 
-	ep, err := n.CreateEndpoint(id)
+	ep, err := n.CreateEndpoint(id, libnetwork.CreateOptionDisableResolution())
 	if err != nil {
 		iface.err = err
 		return
 	}
 
-	sbx, err := c.NewSandbox(id)
+	sbx, err := c.NewSandbox(id, libnetwork.OptionUseExternalKey())
 	if err != nil {
 		iface.err = err
 		return
@@ -99,10 +101,10 @@ func (iface *lnInterface) Set(s *specs.Spec) {
 
 func (iface *lnInterface) Close() error {
 	<-iface.ready
-	err := iface.sbx.Delete()
-	if iface.err != nil {
-		// iface.err takes precedence over cleanup errors
-		return iface.err
-	}
-	return err
+	go func() {
+		if err := iface.sbx.Delete(); err != nil {
+			logrus.Errorf("failed to delete builder network sandbox: %v", err)
+		}
+	}()
+	return iface.err
 }

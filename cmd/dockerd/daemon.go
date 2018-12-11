@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	containerddefaults "github.com/containerd/containerd/defaults"
 	"github.com/docker/distribution/uuid"
 	"github.com/docker/docker/api"
 	apiserver "github.com/docker/docker/api/server"
@@ -140,22 +141,25 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if cli.Config.ContainerdAddr == "" && runtime.GOOS != "windows" {
-		opts, err := cli.getContainerdDaemonOpts()
-		if err != nil {
-			cancel()
-			return errors.Wrap(err, "failed to generate containerd options")
+		if !systemContainerdRunning() {
+			opts, err := cli.getContainerdDaemonOpts()
+			if err != nil {
+				cancel()
+				return errors.Wrap(err, "failed to generate containerd options")
+			}
+
+			r, err := supervisor.Start(ctx, filepath.Join(cli.Config.Root, "containerd"), filepath.Join(cli.Config.ExecRoot, "containerd"), opts...)
+			if err != nil {
+				cancel()
+				return errors.Wrap(err, "failed to start containerd")
+			}
+			cli.Config.ContainerdAddr = r.Address()
+
+			// Try to wait for containerd to shutdown
+			defer r.WaitTimeout(10 * time.Second)
+		} else {
+			cli.Config.ContainerdAddr = containerddefaults.DefaultAddress
 		}
-
-		r, err := supervisor.Start(ctx, filepath.Join(cli.Config.Root, "containerd"), filepath.Join(cli.Config.ExecRoot, "containerd"), opts...)
-		if err != nil {
-			cancel()
-			return errors.Wrap(err, "failed to start containerd")
-		}
-
-		cli.Config.ContainerdAddr = r.Address()
-
-		// Try to wait for containerd to shutdown
-		defer r.WaitTimeout(10 * time.Second)
 	}
 	defer cancel()
 
@@ -180,7 +184,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	d.StoreHosts(hosts)
 
-	// validate after NewDaemon has restored enabled plugins. Dont change order.
+	// validate after NewDaemon has restored enabled plugins. Don't change order.
 	if err := validateAuthzPlugins(cli.Config.AuthorizationPlugins, pluginStore); err != nil {
 		return errors.Wrap(err, "failed to validate authorization plugin")
 	}
@@ -259,7 +263,7 @@ type routerOptions struct {
 	cluster        *cluster.Cluster
 }
 
-func newRouterOptions(config *config.Config, daemon *daemon.Daemon) (routerOptions, error) {
+func newRouterOptions(config *config.Config, d *daemon.Daemon) (routerOptions, error) {
 	opts := routerOptions{}
 	sm, err := session.NewManager()
 	if err != nil {
@@ -280,21 +284,25 @@ func newRouterOptions(config *config.Config, daemon *daemon.Daemon) (routerOptio
 		return opts, errors.Wrap(err, "failed to create fscache")
 	}
 
-	manager, err := dockerfile.NewBuildManager(daemon.BuilderBackend(), sm, buildCache, daemon.IdentityMapping())
+	manager, err := dockerfile.NewBuildManager(d.BuilderBackend(), sm, buildCache, d.IdentityMapping())
 	if err != nil {
 		return opts, err
 	}
+	cgroupParent := newCgroupParent(config)
 	bk, err := buildkit.New(buildkit.Opt{
-		SessionManager:    sm,
-		Root:              filepath.Join(config.Root, "buildkit"),
-		Dist:              daemon.DistributionServices(),
-		NetworkController: daemon.NetworkController(),
+		SessionManager:      sm,
+		Root:                filepath.Join(config.Root, "buildkit"),
+		Dist:                d.DistributionServices(),
+		NetworkController:   d.NetworkController(),
+		DefaultCgroupParent: cgroupParent,
+		ResolverOpt:         d.NewResolveOptionsFunc(),
+		BuilderConfig:       config.Builder,
 	})
 	if err != nil {
 		return opts, err
 	}
 
-	bb, err := buildbackend.NewBackend(daemon.ImageService(), manager, buildCache, bk)
+	bb, err := buildbackend.NewBackend(d.ImageService(), manager, buildCache, bk)
 	if err != nil {
 		return opts, errors.Wrap(err, "failed to create buildmanager")
 	}
@@ -303,8 +311,8 @@ func newRouterOptions(config *config.Config, daemon *daemon.Daemon) (routerOptio
 		buildBackend:   bb,
 		buildCache:     buildCache,
 		buildkit:       bk,
-		features:       daemon.Features(),
-		daemon:         daemon,
+		features:       d.Features(),
+		daemon:         d,
 	}, nil
 }
 
@@ -656,4 +664,9 @@ func validateAuthzPlugins(requestedPlugins []string, pg plugingetter.PluginGette
 		}
 	}
 	return nil
+}
+
+func systemContainerdRunning() bool {
+	_, err := os.Lstat(containerddefaults.DefaultAddress)
+	return err == nil
 }

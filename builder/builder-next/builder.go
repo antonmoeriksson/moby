@@ -2,6 +2,7 @@ package buildkit
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -13,23 +14,40 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/builder"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/libnetwork"
 	controlapi "github.com/moby/buildkit/api/services/control"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/control"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/tracing"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	grpcmetadata "google.golang.org/grpc/metadata"
 )
 
-var errMultipleFilterValues = errors.New("filters expect only one value")
+type errMultipleFilterValues struct{}
+
+func (errMultipleFilterValues) Error() string { return "filters expect only one value" }
+
+func (errMultipleFilterValues) InvalidParameter() {}
+
+type errConflictFilter struct {
+	a, b string
+}
+
+func (e errConflictFilter) Error() string {
+	return fmt.Sprintf("conflicting filters: %q and %q", e.a, e.b)
+}
+
+func (errConflictFilter) InvalidParameter() {}
 
 var cacheFields = map[string]bool{
 	"id":          true,
@@ -50,10 +68,13 @@ func init() {
 
 // Opt is option struct required for creating the builder
 type Opt struct {
-	SessionManager    *session.Manager
-	Root              string
-	Dist              images.DistributionServices
-	NetworkController libnetwork.NetworkController
+	SessionManager      *session.Manager
+	Root                string
+	Dist                images.DistributionServices
+	NetworkController   libnetwork.NetworkController
+	DefaultCgroupParent string
+	ResolverOpt         resolver.ResolveOptionsFunc
+	BuilderConfig       config.BuilderConfig
 }
 
 // Builder can build using BuildKit backend
@@ -124,6 +145,9 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 
 	validFilters := make(map[string]bool, 1+len(cacheFields))
 	validFilters["unused-for"] = true
+	validFilters["until"] = true
+	validFilters["label"] = true  // TODO(tiborvass): handle label
+	validFilters["label!"] = true // TODO(tiborvass): handle label!
 	for k, v := range cacheFields {
 		validFilters[k] = v
 	}
@@ -131,43 +155,18 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 		return 0, nil, err
 	}
 
-	var unusedFor time.Duration
-	unusedForValues := opts.Filters.Get("unused-for")
-
-	switch len(unusedForValues) {
-	case 0:
-
-	case 1:
-		var err error
-		unusedFor, err = time.ParseDuration(unusedForValues[0])
-		if err != nil {
-			return 0, nil, errors.Wrap(err, "unused-for filter expects a duration (e.g., '24h')")
-		}
-
-	default:
-		return 0, nil, errMultipleFilterValues
-	}
-
-	bkFilter := make([]string, 0, opts.Filters.Len())
-	for cacheField := range cacheFields {
-		values := opts.Filters.Get(cacheField)
-		switch len(values) {
-		case 0:
-			bkFilter = append(bkFilter, cacheField)
-		case 1:
-			bkFilter = append(bkFilter, cacheField+"=="+values[0])
-		default:
-			return 0, nil, errMultipleFilterValues
-		}
+	pi, err := toBuildkitPruneInfo(opts)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	eg.Go(func() error {
 		defer close(ch)
 		return b.controller.Prune(&controlapi.PruneRequest{
-			All:          opts.All,
-			KeepDuration: int64(unusedFor),
-			KeepBytes:    opts.KeepStorage,
-			Filter:       bkFilter,
+			All:          pi.All,
+			KeepDuration: int64(pi.KeepDuration),
+			KeepBytes:    pi.KeepBytes,
+			Filter:       pi.Filter,
 		}, &pruneProxy{
 			streamProxy: streamProxy{ctx: ctx},
 			ch:          ch,
@@ -521,10 +520,64 @@ func toBuildkitExtraHosts(inp []string) (string, error) {
 	hosts := make([]string, 0, len(inp))
 	for _, h := range inp {
 		parts := strings.Split(h, ":")
+
 		if len(parts) != 2 || parts[0] == "" || net.ParseIP(parts[1]) == nil {
 			return "", errors.Errorf("invalid host %s", h)
 		}
 		hosts = append(hosts, parts[0]+"="+parts[1])
 	}
 	return strings.Join(hosts, ","), nil
+}
+
+func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, error) {
+	var until time.Duration
+	untilValues := opts.Filters.Get("until")          // canonical
+	unusedForValues := opts.Filters.Get("unused-for") // deprecated synonym for "until" filter
+
+	if len(untilValues) > 0 && len(unusedForValues) > 0 {
+		return client.PruneInfo{}, errConflictFilter{"until", "unused-for"}
+	}
+	filterKey := "until"
+	if len(unusedForValues) > 0 {
+		filterKey = "unused-for"
+	}
+	untilValues = append(untilValues, unusedForValues...)
+
+	switch len(untilValues) {
+	case 0:
+		// nothing to do
+	case 1:
+		var err error
+		until, err = time.ParseDuration(untilValues[0])
+		if err != nil {
+			return client.PruneInfo{}, errors.Wrapf(err, "%q filter expects a duration (e.g., '24h')", filterKey)
+		}
+	default:
+		return client.PruneInfo{}, errMultipleFilterValues{}
+	}
+
+	bkFilter := make([]string, 0, opts.Filters.Len())
+	for cacheField := range cacheFields {
+		if opts.Filters.Include(cacheField) {
+			values := opts.Filters.Get(cacheField)
+			switch len(values) {
+			case 0:
+				bkFilter = append(bkFilter, cacheField)
+			case 1:
+				if cacheField == "id" {
+					bkFilter = append(bkFilter, cacheField+"~="+values[0])
+				} else {
+					bkFilter = append(bkFilter, cacheField+"=="+values[0])
+				}
+			default:
+				return client.PruneInfo{}, errMultipleFilterValues{}
+			}
+		}
+	}
+	return client.PruneInfo{
+		All:          opts.All,
+		KeepDuration: until,
+		KeepBytes:    opts.KeepStorage,
+		Filter:       []string{strings.Join(bkFilter, ",")},
+	}, nil
 }

@@ -20,6 +20,7 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 	v.MemoryLimit = sysInfo.MemoryLimit
 	v.SwapLimit = sysInfo.SwapLimit
 	v.KernelMemory = sysInfo.KernelMemory
+	v.KernelMemoryTCP = sysInfo.KernelMemoryTCP
 	v.OomKillDisable = sysInfo.OomKillDisable
 	v.CPUCfsPeriod = sysInfo.CPUCfsPeriod
 	v.CPUCfsQuota = sysInfo.CPUCfsQuota
@@ -29,7 +30,6 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 	v.DefaultRuntime = daemon.configStore.GetDefaultRuntimeName()
 	v.InitBinary = daemon.configStore.GetInitPath()
 
-	v.RuncCommit.Expected = dockerversion.RuncCommitID
 	defaultRuntimeBinary := daemon.configStore.GetRuntime(v.DefaultRuntime).Path
 	if rv, err := exec.Command(defaultRuntimeBinary, "--version").Output(); err == nil {
 		parts := strings.Split(strings.TrimSpace(string(rv)), "\n")
@@ -49,13 +49,20 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 		v.RuncCommit.ID = "N/A"
 	}
 
-	v.ContainerdCommit.Expected = dockerversion.ContainerdCommitID
+	// runc is now shipped as a separate package. Set "expected" to same value
+	// as "ID" to prevent clients from reporting a version-mismatch
+	v.RuncCommit.Expected = v.RuncCommit.ID
+
 	if rv, err := daemon.containerd.Version(context.Background()); err == nil {
 		v.ContainerdCommit.ID = rv.Revision
 	} else {
 		logrus.Warnf("failed to retrieve containerd version: %v", err)
 		v.ContainerdCommit.ID = "N/A"
 	}
+
+	// containerd is now shipped as a separate package. Set "expected" to same
+	// value as "ID" to prevent clients from reporting a version-mismatch
+	v.ContainerdCommit.Expected = v.ContainerdCommit.ID
 
 	defaultInitBinary := daemon.configStore.GetInitPath()
 	if rv, err := exec.Command(defaultInitBinary, "--version").Output(); err == nil {
@@ -78,6 +85,9 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 	}
 	if !v.KernelMemory {
 		v.Warnings = append(v.Warnings, "WARNING: No kernel memory limit support")
+	}
+	if !v.KernelMemoryTCP {
+		v.Warnings = append(v.Warnings, "WARNING: No kernel memory TCP limit support")
 	}
 	if !v.OomKillDisable {
 		v.Warnings = append(v.Warnings, "WARNING: No oom kill disable support")
@@ -106,9 +116,6 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 }
 
 func fillDriverWarnings(v *types.Info) {
-	if v.DriverStatus == nil {
-		return
-	}
 	for _, pair := range v.DriverStatus {
 		if pair[0] == "Data loop file" {
 			msg := fmt.Sprintf("WARNING: %s: usage of loopback devices is "+
@@ -134,9 +141,6 @@ func fillDriverWarnings(v *types.Info) {
 }
 
 func getBackingFs(v *types.Info) string {
-	if v.DriverStatus == nil {
-		return ""
-	}
 	for _, pair := range v.DriverStatus {
 		if pair[0] == "Backing Filesystem" {
 			return pair[1]

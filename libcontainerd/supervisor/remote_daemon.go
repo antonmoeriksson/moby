@@ -15,7 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/services/server"
+	"github.com/containerd/containerd/services/server/config"
 	"github.com/docker/docker/pkg/system"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -27,8 +27,8 @@ const (
 	shutdownTimeout         = 15 * time.Second
 	startupTimeout          = 15 * time.Second
 	configFile              = "containerd.toml"
-	binaryName              = "docker-containerd"
-	pidFile                 = "docker-containerd.pid"
+	binaryName              = "containerd"
+	pidFile                 = "containerd.pid"
 )
 
 type pluginConfigs struct {
@@ -37,13 +37,13 @@ type pluginConfigs struct {
 
 type remote struct {
 	sync.RWMutex
-	server.Config
+	config.Config
 
 	daemonPid int
 	logger    *logrus.Entry
 
 	daemonWaitCh  chan struct{}
-	daemonStartCh chan struct{}
+	daemonStartCh chan error
 	daemonStopCh  chan struct{}
 
 	rootDir     string
@@ -65,14 +65,14 @@ func Start(ctx context.Context, rootDir, stateDir string, opts ...DaemonOpt) (Da
 	r := &remote{
 		rootDir:  rootDir,
 		stateDir: stateDir,
-		Config: server.Config{
+		Config: config.Config{
 			Root:  filepath.Join(rootDir, "daemon"),
 			State: filepath.Join(stateDir, "daemon"),
 		},
 		pluginConfs:   pluginConfigs{make(map[string]interface{})},
 		daemonPid:     -1,
 		logger:        logrus.WithField("module", "libcontainerd"),
-		daemonStartCh: make(chan struct{}),
+		daemonStartCh: make(chan error, 1),
 		daemonStopCh:  make(chan struct{}),
 	}
 
@@ -92,7 +92,10 @@ func Start(ctx context.Context, rootDir, stateDir string, opts ...DaemonOpt) (Da
 	select {
 	case <-time.After(startupTimeout):
 		return nil, errors.New("timeout waiting for containerd to start")
-	case <-r.daemonStartCh:
+	case err := <-r.daemonStartCh:
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return r, nil
@@ -269,7 +272,11 @@ func (r *remote) monitorDaemon(ctx context.Context) {
 
 			os.RemoveAll(r.GRPC.Address)
 			if err := r.startContainerd(); err != nil {
-				r.logger.WithError(err).Error("failed starting containerd")
+				if !started {
+					r.daemonStartCh <- err
+					return
+				}
+				r.logger.WithError(err).Error("failed restarting containerd")
 				delay = time.After(50 * time.Millisecond)
 				continue
 			}
