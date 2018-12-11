@@ -41,7 +41,7 @@ const (
 	splunkVerifyConnectionKey     = "splunk-verify-connection"
 	splunkGzipCompressionKey      = "splunk-gzip"
 	splunkGzipCompressionLevelKey = "splunk-gzip-level"
-	testAntonKey                  = "test-anton-key"
+	splunkHostNameKey             = "splunk-host-name"
 	envKey                        = "env"
 	envRegexKey                   = "env-regex"
 	labelsKey                     = "labels"
@@ -150,12 +150,12 @@ func init() {
 
 // New creates splunk logger driver using configuration passed in context
 func New(info logger.Info) (logger.Logger, error) {
-	fmt.Printf("\nI am back!!! !!! Now with a extra key and in the NEW func code  AND real inpout and chanes host name\n")
-	fmt.Printf("\n Input param = %s\n", info.Config[testAntonKey])
 	hostname, err := info.Hostname()
-	if info.Config[testAntonKey] != "" {
-		hostname = info.Config[testAntonKey]
+	
+	if info.Config[splunkHostNameKey] != "" {
+		hostname = info.Config[splunkHostNameKey]
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("%s: cannot access hostname to set source field", driverName)
 	}
@@ -571,7 +571,7 @@ func ValidateLogOpt(cfg map[string]string) error {
 		case envKey:
 		case envRegexKey:
 		case labelsKey:
-		case testAntonKey:
+		case splunkHostNameKey:
 		case tagKey:
 		default:
 			return fmt.Errorf("unknown log opt '%s' for %s log driver", key, driverName)
