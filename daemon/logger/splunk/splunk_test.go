@@ -48,8 +48,6 @@ func TestValidateLogOpt(t *testing.T) {
 	}
 }
 
-
-
 // Driver require user to specify required options
 func TestNewMissedConfig(t *testing.T) {
 	info := logger.Info{
