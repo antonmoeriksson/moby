@@ -151,7 +151,7 @@ func init() {
 // New creates splunk logger driver using configuration passed in context
 func New(info logger.Info) (logger.Logger, error) {
 	hostname, err := info.Hostname()
-	
+
 	if info.Config[splunkHostNameKey] != "" {
 		hostname = info.Config[splunkHostNameKey]
 	}
